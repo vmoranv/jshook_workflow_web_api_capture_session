@@ -1,0 +1,4 @@
+name: web-api-capture-session
+description: Declarative workflow for navigation, action replay, request capture, auth extraction, and HAR/report export.
+author: vmoranv
+source_repo: https://github.com/vmoranv/jshook_workflow_web_api_capture_session
