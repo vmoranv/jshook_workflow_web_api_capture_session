@@ -1,9 +1,73 @@
-import {
-  branchNode,
-  sequenceNode,
-  toolNode,
-} from '@jshookmcp/extension-sdk/workflow';
-import type { WorkflowContract } from '@jshookmcp/extension-sdk/workflow';
+type RetryPolicy = {
+  maxAttempts: number;
+  backoffMs: number;
+  multiplier?: number;
+};
+
+type WorkflowExecutionContext = {
+  workflowRunId: string;
+  profile: string;
+  invokeTool(toolName: string, args: Record<string, unknown>): Promise<unknown>;
+  emitSpan(name: string, attrs?: Record<string, unknown>): void;
+  emitMetric(
+    name: string,
+    value: number,
+    type: 'counter' | 'gauge' | 'histogram',
+    attrs?: Record<string, unknown>,
+  ): void;
+  getConfig<T = unknown>(path: string, fallback?: T): T;
+};
+
+type ToolNode = {
+  kind: 'tool';
+  id: string;
+  toolName: string;
+  input?: Record<string, unknown>;
+  timeoutMs?: number;
+  retry?: RetryPolicy;
+};
+
+type SequenceNode = {
+  kind: 'sequence';
+  id: string;
+  steps: WorkflowNode[];
+};
+
+type WorkflowNode = ToolNode | SequenceNode;
+
+type WorkflowContract = {
+  kind: 'workflow-contract';
+  version: 1;
+  id: string;
+  displayName: string;
+  description?: string;
+  tags?: string[];
+  timeoutMs?: number;
+  defaultMaxConcurrency?: number;
+  build(ctx: WorkflowExecutionContext): WorkflowNode;
+  onStart?(ctx: WorkflowExecutionContext): Promise<void> | void;
+  onFinish?(ctx: WorkflowExecutionContext, result: unknown): Promise<void> | void;
+  onError?(ctx: WorkflowExecutionContext, error: Error): Promise<void> | void;
+};
+
+function toolNode(
+  id: string,
+  toolName: string,
+  options?: { input?: Record<string, unknown>; retry?: RetryPolicy; timeoutMs?: number },
+): ToolNode {
+  return {
+    kind: 'tool',
+    id,
+    toolName,
+    input: options?.input,
+    retry: options?.retry,
+    timeoutMs: options?.timeoutMs,
+  };
+}
+
+function sequenceNode(id: string, steps: WorkflowNode[]): SequenceNode {
+  return { kind: 'sequence', id, steps };
+}
 
 const workflowId = 'workflow.web-api-capture-session.v1';
 
@@ -17,199 +81,93 @@ const webApiCaptureSessionWorkflow: WorkflowContract = {
   id: workflowId,
   displayName: 'Web API Capture Session',
   description:
-    'Navigate a page, optionally replay actions, capture requests, extract auth material, and optionally export a HAR artifact.',
+    'Delegate to the built-in web_api_capture_session tool using only valid action types (click/type/wait/evaluate), then emit a concise summary.',
   tags: ['workflow', 'capture', 'network', 'auth', 'har', 'reverse'],
   timeoutMs: 10 * 60_000,
   defaultMaxConcurrency: 1,
 
   build(ctx) {
-    const url = ctx.getConfig<string>(
-      'workflows.webApiCapture.url',
-      'https://example.com',
-    );
-    const waitUntil = ctx.getConfig<string>(
-      'workflows.webApiCapture.waitUntil',
-      'domcontentloaded',
-    );
+    const prefix = 'workflows.webApiCapture';
+    const url = ctx.getConfig<string>(`${prefix}.url`, 'https://example.com');
+    const waitUntil = ctx.getConfig<string>(`${prefix}.waitUntil`, 'domcontentloaded');
+    const waitAfterActionsMs = ctx.getConfig<number>(`${prefix}.waitAfterActionsMs`, 1500);
 
-    const enableClickStep = ctx.getConfig<boolean>(
-      'workflows.webApiCapture.enableClickStep',
-      false,
-    );
-    const clickSelector = ctx.getConfig<string>(
-      'workflows.webApiCapture.clickSelector',
-      'button[data-capture]',
-    );
+    const enableTypeStep = ctx.getConfig<boolean>(`${prefix}.enableTypeStep`, false);
+    const typeSelector = ctx.getConfig<string>(`${prefix}.typeSelector`, "input[name='query']");
+    const typeText = ctx.getConfig<string>(`${prefix}.typeText`, 'capture me');
 
-    const enableTypeStep = ctx.getConfig<boolean>(
-      'workflows.webApiCapture.enableTypeStep',
-      false,
-    );
-    const typeSelector = ctx.getConfig<string>(
-      'workflows.webApiCapture.typeSelector',
-      "input[name='query']",
-    );
-    const typeText = ctx.getConfig<string>(
-      'workflows.webApiCapture.typeText',
-      'capture me',
-    );
+    const enableClickStep = ctx.getConfig<boolean>(`${prefix}.enableClickStep`, false);
+    const clickSelector = ctx.getConfig<string>(`${prefix}.clickSelector`, 'button[data-capture]');
 
-    const enableEvaluateStep = ctx.getConfig<boolean>(
-      'workflows.webApiCapture.enableEvaluateStep',
-      false,
-    );
+    const enableWaitStep = ctx.getConfig<boolean>(`${prefix}.enableWaitStep`, false);
+    const waitSelector = ctx.getConfig<string>(`${prefix}.waitSelector`, '');
+    const waitText = ctx.getConfig<string>(`${prefix}.waitText`, '');
+    const waitDelayMs = ctx.getConfig<number>(`${prefix}.waitDelayMs`, 0);
+
+    const enableEvaluateStep = ctx.getConfig<boolean>(`${prefix}.enableEvaluateStep`, false);
     const evaluateExpression = ctx.getConfig<string>(
-      'workflows.webApiCapture.evaluateExpression',
+      `${prefix}.evaluateExpression`,
       'window.__captureProbe = true',
     );
 
-    const waitAfterActionsMs = ctx.getConfig<number>(
-      'workflows.webApiCapture.waitAfterActionsMs',
-      1500,
-    );
-    const exportHar = ctx.getConfig<boolean>(
-      'workflows.webApiCapture.exportHar',
-      true,
-    );
+    const exportHar = ctx.getConfig<boolean>(`${prefix}.exportHar`, true);
+    const exportReport = ctx.getConfig<boolean>(`${prefix}.exportReport`, false);
     const harOutputPath = ctx.getConfig<string>(
-      'workflows.webApiCapture.harOutputPath',
-      `artifacts/har/jshook-capture-${isoTimestampForFile()}.har`,
+      `${prefix}.harOutputPath`,
+      `workflow-smoke-capture-${isoTimestampForFile()}.har`,
+    );
+    const reportOutputPath = ctx.getConfig<string>(
+      `${prefix}.reportOutputPath`,
+      `workflow-smoke-capture-report-${isoTimestampForFile()}.md`,
     );
 
-    const enableNetwork = toolNode('enable-network', 'network_enable', {
-      input: {
-        enableExceptions: true,
-      },
-    });
-
-    const injectFetch = toolNode(
-      'inject-fetch-interceptor',
-      'console_inject_fetch_interceptor',
-    );
-
-    const injectXhr = toolNode(
-      'inject-xhr-interceptor',
-      'console_inject_xhr_interceptor',
-    );
-
-    const navigate = toolNode('navigate-target', 'page_navigate', {
-      input: {
-        url,
-        waitUntil,
-        enableNetworkMonitoring: true,
-      },
-    });
-
-    const clickBranch = branchNode(
-      'optional-click-step',
-      'web_api_capture_enable_click',
-      toolNode('click-action', 'page_click', {
-        input: {
-          selector: clickSelector,
-        },
-      }),
-      toolNode('skip-click-action', 'console_execute', {
-        input: {
-          expression: '({ skipped: "click", reason: "config_disabled" })',
-        },
-      }),
-      () => enableClickStep,
-    );
-
-    const typeBranch = branchNode(
-      'optional-type-step',
-      'web_api_capture_enable_type',
-      toolNode('type-action', 'page_type', {
-        input: {
-          selector: typeSelector,
-          text: typeText,
-          delay: 20,
-        },
-      }),
-      toolNode('skip-type-action', 'console_execute', {
-        input: {
-          expression: '({ skipped: "type", reason: "config_disabled" })',
-        },
-      }),
-      () => enableTypeStep,
-    );
-
-    const evaluateBranch = branchNode(
-      'optional-evaluate-step',
-      'web_api_capture_enable_evaluate',
-      toolNode('evaluate-action', 'page_evaluate', {
-        input: {
-          code: evaluateExpression,
-        },
-      }),
-      toolNode('skip-evaluate-action', 'console_execute', {
-        input: {
-          expression: '({ skipped: "evaluate", reason: "config_disabled" })',
-        },
-      }),
-      () => enableEvaluateStep,
-    );
-
-    const settleRequests = toolNode('settle-requests', 'page_evaluate', {
-      input: {
-        code: `new Promise((resolve) => setTimeout(() => resolve({ waitedMs: ${Math.max(0, waitAfterActionsMs)} }), ${Math.max(0, waitAfterActionsMs)}))`,
-      },
-      timeoutMs: Math.max(5_000, waitAfterActionsMs + 2_000),
-    });
-
-    const getStats = toolNode('get-network-stats', 'network_get_stats');
-
-    const getRequests = toolNode('get-network-requests', 'network_get_requests', {
-      input: {
-        limit: 500,
-        offset: 0,
-      },
-    });
-
-    const extractAuth = toolNode('extract-auth-material', 'network_extract_auth', {
-      input: {
-        minConfidence: 0.4,
-      },
-    });
-
-    const exportHarBranch = branchNode(
-      'optional-har-export',
-      'web_api_capture_export_har',
-      toolNode('export-har', 'network_export_har', {
-        input: {
-          outputPath: harOutputPath,
-          includeBodies: false,
-        },
-      }),
-      toolNode('skip-har-export', 'console_execute', {
-        input: {
-          expression: '({ skipped: "network_export_har", reason: "config_disabled" })',
-        },
-      }),
-      () => exportHar,
-    );
-
-    const summarize = toolNode('capture-summary', 'console_execute', {
-      input: {
-        expression:
-          `({ status: "web_api_capture_sequence_complete", workflowId: "${workflowId}", url: ${JSON.stringify(url)}, waitUntil: ${JSON.stringify(waitUntil)}, exportedHar: ${exportHar ? 'true' : 'false'}, harOutputPath: ${JSON.stringify(harOutputPath)}, expectedNext: ["inspect network_get_stats result", "inspect network_get_requests result", "inspect network_extract_auth result"] })`,
-      },
-    });
+    const actions: Array<Record<string, unknown>> = [];
+    if (enableTypeStep) {
+      actions.push({ type: 'type', selector: typeSelector, text: typeText });
+    }
+    if (enableClickStep) {
+      actions.push({ type: 'click', selector: clickSelector });
+    }
+    if (enableWaitStep) {
+      const waitAction: Record<string, unknown> = { type: 'wait' };
+      if (waitSelector) waitAction.selector = waitSelector;
+      if (waitText) waitAction.text = waitText;
+      if (waitDelayMs > 0) waitAction.delayMs = waitDelayMs;
+      actions.push(waitAction);
+    }
+    if (enableEvaluateStep) {
+      actions.push({ type: 'evaluate', expression: evaluateExpression });
+    }
 
     return sequenceNode('web-api-capture-session-root', [
-      enableNetwork,
-      injectFetch,
-      injectXhr,
-      navigate,
-      clickBranch,
-      typeBranch,
-      evaluateBranch,
-      settleRequests,
-      getStats,
-      getRequests,
-      extractAuth,
-      exportHarBranch,
-      summarize,
+      toolNode('capture-session', 'web_api_capture_session', {
+        input: {
+          url,
+          waitUntil,
+          actions,
+          waitAfterActionsMs,
+          exportHar,
+          exportReport,
+          harOutputPath,
+          reportOutputPath,
+        },
+        timeoutMs: 12 * 60_000,
+      }),
+      toolNode('capture-summary', 'console_execute', {
+        input: {
+          expression: `(${JSON.stringify({
+            status: 'web_api_capture_sequence_complete',
+            workflowId,
+            url,
+            waitUntil,
+            actions,
+            exportHar,
+            exportReport,
+            harOutputPath,
+            reportOutputPath,
+          })})`,
+        },
+      }),
     ]);
   },
 
